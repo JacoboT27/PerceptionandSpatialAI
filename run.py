@@ -1,0 +1,177 @@
+"""
+video-to-3d: run.py
+-------------------
+Single entry point for the video → 3D reconstruction pipeline.
+
+Usage:
+    python run.py --video inputs/myvideo.mp4
+    python run.py --video inputs/myvideo.mp4 --fps 3 --conf 0.6 --output outputs/my_scene
+
+Pipeline stages:
+    1. Extract frames from video (ffmpeg)
+    2. Run AMB3R feed-forward reconstruction
+    3. Export .ply point cloud + transforms.json (Nerfstudio-compatible camera poses)
+"""
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+from pipeline.extract_frames import extract_frames
+from pipeline.reconstruct import run_amb3r
+from pipeline.export import export_results
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="video-to-3d: reconstruct a 3D scene from a phone video using AMB3R",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--video",
+        type=str,
+        required=True,
+        help="Path to input video file (e.g. inputs/myvideo.mp4)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output directory. Defaults to outputs/<video_name>/",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=2.0,
+        help="Frame extraction rate (frames per second). Lower = faster, fewer details. Recommended: 1-5.",
+    )
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=150,
+        help="Maximum number of frames to use. Caps memory and runtime. Increase for large scenes.",
+    )
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.5,
+        help="Confidence threshold for point filtering (0.0–1.0). Higher = fewer but more reliable points.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="./checkpoints/amb3r.pt",
+        help="Path to AMB3R checkpoint file.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help="Device to run inference on. CPU is very slow; cuda strongly recommended.",
+    )
+    return parser.parse_args()
+
+
+def banner(text: str):
+    width = 60
+    print("\n" + "=" * width)
+    print(f"  {text}")
+    print("=" * width)
+
+
+def main():
+    args = parse_args()
+
+    video_path = Path(args.video)
+    if not video_path.exists():
+        print(f"[ERROR] Video not found: {video_path}")
+        sys.exit(1)
+
+    # Resolve output directory
+    if args.output:
+        output_dir = Path(args.output)
+    else:
+        output_dir = Path("outputs") / video_path.stem
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    frames_dir = output_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+
+    print(f"\n  video-to-3d pipeline")
+    print(f"  Input  : {video_path}")
+    print(f"  Output : {output_dir}")
+    print(f"  Device : {args.device}")
+
+    # ------------------------------------------------------------------ #
+    # Stage 1: Frame Extraction
+    # ------------------------------------------------------------------ #
+    banner("Stage 1 / 3 — Frame Extraction")
+    t0 = time.time()
+
+    n_frames = extract_frames(
+        video_path=video_path,
+        output_dir=frames_dir,
+        fps=args.fps,
+        max_frames=args.max_frames,
+    )
+
+    print(f"  Extracted {n_frames} frames  ({time.time() - t0:.1f}s)")
+
+    if n_frames == 0:
+        print("[ERROR] No frames extracted. Check your video path and ffmpeg installation.")
+        sys.exit(1)
+
+    # ------------------------------------------------------------------ #
+    # Stage 2: AMB3R Reconstruction
+    # ------------------------------------------------------------------ #
+    banner("Stage 2 / 3 — AMB3R Reconstruction")
+    t1 = time.time()
+
+    reconstruction = run_amb3r(
+        frames_dir=frames_dir,
+        checkpoint_path=args.checkpoint,
+        device=args.device,
+        conf_thresh=args.conf,
+        max_images=args.max_frames,
+    )
+
+    print(f"  Reconstruction complete  ({time.time() - t1:.1f}s)")
+    print(f"  Points (before filtering) : {reconstruction['pts'].shape[0]:,}")
+    mask = reconstruction['conf_sig'] > args.conf
+    print(f"  Points (after  filtering) : {mask.sum():,}  (conf > {args.conf})")
+
+    # ------------------------------------------------------------------ #
+    # Stage 3: Export
+    # ------------------------------------------------------------------ #
+    banner("Stage 3 / 3 — Exporting Results")
+    t2 = time.time()
+
+    exported = export_results(
+        reconstruction=reconstruction,
+        output_dir=output_dir,
+        conf_thresh=args.conf,
+        frames_dir=frames_dir,
+    )
+
+    print(f"  Export complete  ({time.time() - t2:.1f}s)")
+
+    # ------------------------------------------------------------------ #
+    # Summary
+    # ------------------------------------------------------------------ #
+    banner("Done")
+    total = time.time() - t0
+    print(f"  Total time : {total:.1f}s\n")
+    print(f"  Outputs saved to: {output_dir}/\n")
+    for label, path in exported.items():
+        print(f"    [{label}]  {path}")
+
+    print(
+        "\n  Tip: open the .ply in MeshLab or CloudCompare to inspect the point cloud."
+        "\n  Tip: use transforms.json with Nerfstudio (ns-train splatfacto) for 3DGS.\n"
+    )
+
+
+if __name__ == "__main__":
+    main()
