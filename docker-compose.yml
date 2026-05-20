@@ -1,0 +1,41 @@
+# ============================================================
+# video-to-3d — docker-compose.yml
+# ============================================================
+# Usage:
+#   docker compose build          # first-time setup (~30-45 min)
+#   docker compose run --rm app python run.py --video inputs/myvideo.mp4
+#
+# Mounts:
+#   ./checkpoints → weights (download once, reuse across runs)
+#   ./inputs      → drop your videos here
+#   ./outputs     → results appear here
+# ============================================================
+
+services:
+  app:
+    build: .
+    image: video-to-3d:latest
+
+    # GPU access — requires NVIDIA Container Toolkit
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # Mount local folders into the container
+    # Changes to source code are reflected immediately (no rebuild needed)
+    volumes:
+      - ./checkpoints:/workspace/checkpoints
+      - ./inputs:/workspace/inputs
+      - ./outputs:/workspace/outputs
+      - ./pipeline:/workspace/pipeline
+      - ./run.py:/workspace/run.py
+
+    # Keep container running for interactive use
+    stdin_open: true
+    tty: true
+
+    working_dir: /workspace
