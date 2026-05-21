@@ -7,6 +7,24 @@ Built on [AMB3R](https://github.com/HengyiWang/amb3r) (CVPR 2026) — a feed-for
 ```
 phone video  ->  frame extraction  ->  AMB3R reconstruction  ->  scene.ply + transforms.json
 ```
+---
+
+## Example Outputs
+ 
+| Input Video | Viewer |
+|---|---|
+| ![input](examples/basketball.png) | ![pointcloud](examples/basketabll_reconstruction.png)|
+
+---
+ 
+## Design Choices
+ 
+**Docker:** the entire environment (CUDA, PyTorch, all dependencies) is containerised. Users only need Docker and NVIDIA drivers. No conda, no pip conflicts, no manual CUDA setup.
+ 
+**AMB3R over COLMAP:** COLMAP was my first option, however it takes a lot of time doing the feature matching process and minimizing the reprojection error. On the other hand, AMB3R is feed-forward inference in a single pass. No iterative optimisation, no feature matching pipeline, no calibration required. My main limitation right now is the hardware. With only 8GB of RAM on my GPU I cannot process large videos. 
+ 
+**Two outputs by default** — a filtered `.ply` for immediate inspection and an unfiltered `.ply` for re-thresholding without re-running the model. Camera poses are exported in Nerfstudio format so the pipeline can be extended to 3D Gaussian Splatting without changes.
+ 
 
 ---
 
