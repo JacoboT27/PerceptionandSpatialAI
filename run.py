@@ -21,6 +21,7 @@ from pathlib import Path
 from pipeline.extract_frames import extract_frames
 from pipeline.reconstruct import run_amb3r
 from pipeline.export import export_results
+from pipeline.visualize import view_pointcloud
 
 
 def parse_args():
@@ -70,6 +71,12 @@ def parse_args():
         default="cuda",
         choices=["cuda", "cpu"],
         help="Device to run inference on. CPU is very slow; cuda strongly recommended.",
+    )
+    parser.add_argument(
+        "--no-viewer",
+        action="store_true",
+        default=False,
+        help="Skip the interactive 3D viewer after reconstruction (useful for headless/server runs).",
     )
     return parser.parse_args()
 
@@ -167,10 +174,15 @@ def main():
     for label, path in exported.items():
         print(f"    [{label}]  {path}")
 
-    print(
-        "\n  Tip: open the .ply in MeshLab or CloudCompare to inspect the point cloud."
-        "\n  Tip: use transforms.json with Nerfstudio (ns-train splatfacto) for 3DGS.\n"
-    )
+    # ------------------------------------------------------------------ #
+    # Stage 4: Viewer
+    # ------------------------------------------------------------------ #
+    if not args.no_viewer:
+        banner("Stage 4 / 4 — Launching Viewer")
+        ply_path = output_dir / "scene.ply"
+        view_pointcloud(ply_path)
+    else:
+        print("\n  Viewer skipped (--no-viewer). Open scene.ply in MeshLab or CloudCompare.\n")
 
 
 if __name__ == "__main__":
