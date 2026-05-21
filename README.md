@@ -1,4 +1,4 @@
-# video-to-3d
+# From Video to 3D Reconstruction
 
 **Reconstruct a 3D scene from a phone video**
 
