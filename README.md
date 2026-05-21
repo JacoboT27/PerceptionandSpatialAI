@@ -2,7 +2,7 @@
 
 **Reconstruct a 3D scene from a phone video**
 
-Built on [AMB3R](https://github.com/HengyiWang/amb3r) (CVPR 2026) — a feed-forward metric-scale 3D reconstruction model from UCL. No COLMAP, no manual calibration, no per-scene training.
+Built on [AMB3R](https://github.com/HengyiWang/amb3r) (CVPR 2026) — a feed-forward metric-scale 3D reconstruction model from UCL. 
 
 ```
 phone video  ->  frame extraction  ->  AMB3R reconstruction  ->  scene.ply + transforms.json
@@ -25,7 +25,7 @@ phone video  ->  frame extraction  ->  AMB3R reconstruction  ->  scene.ply + tra
  
 **Two outputs by default** — a filtered `.ply` for immediate inspection and an unfiltered `.ply` for re-thresholding without re-running the model. Camera poses are exported in Nerfstudio format so the pipeline can be extended to 3D Gaussian Splatting without changes.
  
-
+All of the design choices were primarly focused on speed and ease of use. The user only has to run a command on the terminal with the path to the video, and receives a visualization of the 3D rendering. 
 ---
 
 ## System Requirements
@@ -124,11 +124,15 @@ PerceptionandSpatialAI
 ├── README.md
 └── run.py
 ```
+run this once to give display acces to docker: 
+``` 
+xhost +local:docker
+```
 
 then run:
 
 ```bash
-docker compose run --rm -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix app python run.py --video inputs/myvideo.mp4 --max_frames 16
+docker compose run --rm -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix app python run.py --video inputs/myvideo.mp4 --max_frames 18
 
 ```
 
@@ -147,7 +151,7 @@ outputs/myvideo/
 --video        Path to input video (required)
 --output       Custom output directory  (default: outputs/<video_name>/)
 --fps          Frame extraction rate    (default: 2.0  | recommended: 1–5)
---max_frames   Max frames to use        (default: 150  | on 8gb gpu max value before OOM ~16)
+--max_frames   Max frames to use        (default: 150  | on 8gb gpu max value before OOM ~18)
 --conf         Confidence threshold     (default: 0.5  | range: 0.0–1.0)
 --device       cuda or cpu              (default: cuda)
 --checkpoint   Path to weights file     (default: checkpoints/amb3r.pt)
