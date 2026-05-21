@@ -3,13 +3,6 @@ pipeline/reconstruct.py
 -----------------------
 Wraps AMB3R inference.
 Takes a directory of images, returns pointmaps, colours, confidence, and camera poses.
-
-NOTE on dependency patching:
-  - torch_scatter is the REAL package, built from source in the Dockerfile
-    against torch 2.7.1 for sm_120. It is NOT patched. (The old pure-Python
-    patch was incomplete — it lacked segment_csr, which PTV3's backend needs.)
-  - pytorch3d genuinely cannot be compiled for this stack, so its two ops
-    used by AMB3R (knn_points, knn_gather) are still monkey-patched below.
 """
 
 from pathlib import Path
@@ -35,9 +28,87 @@ def _check_checkpoint(checkpoint_path: Path):
         )
 
 
+def _patch_torch_scatter():
+    """
+    torch_scatter 2.1.2 uses a C++ symbol (torch::jit::parseSchemaOrName)
+    that was removed in PyTorch 2.6, causing an OSError on import.
+
+    This patches sys.modules with a pure-PyTorch implementation of the
+    scatter operations AMB3R needs, so torch_scatter never gets loaded.
+    """
+    import sys
+    import types
+    import torch
+
+    def scatter_mean(src, index, dim=0, out=None, dim_size=None):
+        if dim_size is None:
+            dim_size = int(index.max().item()) + 1
+        size = list(src.size())
+        size[dim] = dim_size
+        result = torch.zeros(size, dtype=src.dtype, device=src.device)
+        count  = torch.zeros(dim_size, dtype=src.dtype, device=src.device)
+        idx_exp = index.view(
+            *([1] * dim), -1, *([1] * (src.dim() - dim - 1))
+        ).expand_as(src)
+        result.scatter_add_(dim, idx_exp, src)
+        count.scatter_add_(0, index.reshape(-1),
+                           torch.ones(index.numel(), dtype=src.dtype, device=src.device))
+        count = count.clamp(min=1)
+        shape = [dim_size if i == dim else 1 for i in range(result.dim())]
+        return result / count.view(shape)
+
+    def scatter_add(src, index, dim=0, out=None, dim_size=None):
+        if dim_size is None:
+            dim_size = int(index.max().item()) + 1
+        size = list(src.size())
+        size[dim] = dim_size
+        if out is None:
+            out = torch.zeros(size, dtype=src.dtype, device=src.device)
+        idx_exp = index.view(
+            *([1] * dim), -1, *([1] * (src.dim() - dim - 1))
+        ).expand_as(src)
+        return out.scatter_add_(dim, idx_exp, src)
+
+    def scatter_sum(src, index, dim=0, out=None, dim_size=None):
+        return scatter_add(src, index, dim=dim, out=out, dim_size=dim_size)
+
+    def scatter_max(src, index, dim=0, out=None, dim_size=None, fill_value=0):
+        if dim_size is None:
+            dim_size = int(index.max().item()) + 1
+        size = list(src.size())
+        size[dim] = dim_size
+        result = src.new_full(size, fill_value)
+        idx_exp = index.view(
+            *([1] * dim), -1, *([1] * (src.dim() - dim - 1))
+        ).expand_as(src)
+        result.scatter_reduce_(dim, idx_exp, src, reduce='amax', include_self=True)
+        return result, result.new_zeros(size, dtype=torch.long)
+
+    def scatter_min(src, index, dim=0, out=None, dim_size=None, fill_value=0):
+        if dim_size is None:
+            dim_size = int(index.max().item()) + 1
+        size = list(src.size())
+        size[dim] = dim_size
+        result = src.new_full(size, fill_value)
+        idx_exp = index.view(
+            *([1] * dim), -1, *([1] * (src.dim() - dim - 1))
+        ).expand_as(src)
+        result.scatter_reduce_(dim, idx_exp, src, reduce='amin', include_self=True)
+        return result, result.new_zeros(size, dtype=torch.long)
+
+    mod = types.ModuleType('torch_scatter')
+    mod.scatter_mean = scatter_mean
+    mod.scatter_add  = scatter_add
+    mod.scatter_sum  = scatter_sum
+    mod.scatter_max  = scatter_max
+    mod.scatter_min  = scatter_min
+    sys.modules['torch_scatter'] = mod
+    print("  [patch] torch_scatter replaced with native PyTorch implementation.")
+
+
 def _patch_pytorch3d():
     """
-    pytorch3d fails to compile for this PyTorch + Blackwell stack.
+    pytorch3d fails to compile for PyTorch 2.6 + Blackwell GPUs.
     AMB3R only uses knn_points and knn_gather from pytorch3d.ops —
     both are straightforward to reimplement with native PyTorch.
     """
@@ -88,7 +159,6 @@ def run_amb3r(
     device: str = "cuda",
     conf_thresh: float = 0.5,
     max_images: int = 150,
-    iters: int = 0,
 ) -> Dict[str, np.ndarray]:
     """
     Run AMB3R feed-forward 3D reconstruction on a folder of images.
@@ -112,9 +182,8 @@ def run_amb3r(
     checkpoint_path = Path(checkpoint_path)
     _check_checkpoint(checkpoint_path)
 
-    # pytorch3d cannot be compiled for this stack, so patch it before any
-    # AMB3R imports. torch_scatter is the real, source-built package now —
-    # it must NOT be patched (the old patch lacked segment_csr).
+    # Patch torch_scatter and pytorch3d before any AMB3R imports
+    _patch_torch_scatter()
     _patch_pytorch3d()
 
     print(f"  Loading AMB3R weights from: {checkpoint_path}")
@@ -161,31 +230,13 @@ def run_amb3r(
         if isinstance(views_all[key], torch.Tensor):
             views_all[key] = views_all[key].to(device)
 
-    print(f"  Running inference on {views_all['images'].shape[1]} frames "
-          f"(iters={iters}: {'front-end only' if iters == 0 else 'with back-end'})...")
+    print(f"  Running inference on {views_all['images'].shape[1]} frames...")
 
     # --- Forward pass ---
-    # AMB3R.forward(frames, iters) runs the VGGT front-end once, then `iters`
-    # sparse-voxel back-end refinement passes. iters=0 -> front-end only: it
-    # skips the entire memory-hungry back-end (the stage that OOMs on GPUs with
-    # limited VRAM) and still returns full pointmaps, confidence, and poses.
-    # This is exactly the demo's "0 / 1 : disable / enable backend" toggle.
     with torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu',
                         dtype=torch.bfloat16):
         with torch.no_grad():
-            res = model(views_all, iters=iters)
-
-    # --- Extract outputs ---
-    # Debug: inspect model output structure
-    print(f"  Model output type: {type(res)}")
-    if isinstance(res, (list, tuple)):
-        print(f"  Output is list of length {len(res)}")
-        out = res[-1]
-        if isinstance(out, dict):
-            print(f"  Last element keys: {list(out.keys())}")
-    elif isinstance(res, dict):
-        print(f"  Output keys: {list(res.keys())}")
-        out = res
+            res = model(views_all)
 
     out = res[-1] if isinstance(res, (list, tuple)) else res
 
@@ -194,10 +245,27 @@ def run_amb3r(
     colors = out['images'].permute(0, 1, 3, 4, 2).reshape(-1, 3).cpu().numpy()
     poses  = out['pose'].cpu().numpy()[0]
 
+    # Store original shape (T, H, W) for pixel-to-point mapping in semantic stage
+    world_points_raw = out['world_points']
+    pts_shape = tuple(world_points_raw.shape[1:4])  # (T, H, W)
+
+    # Extract camera intrinsics from dataset (T, 3, 3)
+    if 'camera_intrinsics' in views_all and isinstance(views_all['camera_intrinsics'], torch.Tensor):
+        intrinsics = views_all['camera_intrinsics'].cpu().numpy()[0]  # (T, 3, 3)
+    else:
+        # Fallback: approximate intrinsics based on resolution
+        T = poses.shape[0]
+        H, W = pts_shape[1], pts_shape[2]
+        fx = fy = max(H, W)
+        intrinsics = np.tile(
+            np.array([[fx, 0, W/2], [0, fy, H/2], [0, 0, 1]], dtype=np.float32),
+            (T, 1, 1)
+        )
+
     # Sigmoid-like confidence normalisation matching AMB3R's own demo
     conf_sig = (conf - 1) / conf
 
-    # Clip colors to [0, 1] (model output may be in [-1, 1] or [0, 1])
+    # Clip colors to [0, 1]
     colors = np.clip(colors, 0.0, 1.0)
 
     # Collect image paths in the order they were loaded
@@ -208,5 +276,7 @@ def run_amb3r(
         "colors":      colors.astype(np.float32),
         "conf_sig":    conf_sig.astype(np.float32),
         "poses":       poses.astype(np.float32),
+        "intrinsics":  intrinsics.astype(np.float32),  # (T, 3, 3)
+        "pts_shape":   pts_shape,                       # (T, H, W)
         "image_paths": image_paths,
     }
