@@ -1,7 +1,7 @@
 """
 video-to-3d: run.py
 -------------------
-Single entry point for the video → 3D reconstruction pipeline.
+Single entry point for the video -> 3D reconstruction pipeline.
 
 Usage:
     python run.py --video inputs/myvideo.mp4
@@ -10,9 +10,10 @@ Usage:
 
 Pipeline stages:
     1. Extract frames from video (ffmpeg)
-    2. AMB3R feed-forward reconstruction → point cloud + camera poses
+    2. AMB3R feed-forward reconstruction -> point cloud + camera poses
     3. Export .ply + transforms.json
-    4. Semantic labelling (RAM + SAM + CLIP) — on by default, disable with --no-semantic
+    4. Semantic labelling (Mask2Former segmentation) - on by default,
+       disable with --no-semantic
     5. Interactive viewer (Open3D)
 """
 
@@ -37,23 +38,17 @@ def parse_args():
     parser.add_argument("--output", type=str, default=None,
         help="Output directory. Defaults to outputs/<video_name>/")
     parser.add_argument("--fps", type=float, default=2.0,
-        help="Frame extraction rate (fps). Recommended: 1–5.")
+        help="Frame extraction rate (fps). Recommended: 1-5.")
     parser.add_argument("--max_frames", type=int, default=150,
         help="Maximum number of frames to use.")
     parser.add_argument("--conf", type=float, default=0.5,
-        help="Confidence threshold for point filtering (0.0–1.0).")
+        help="Confidence threshold for point filtering (0.0-1.0).")
     parser.add_argument("--checkpoint", type=str, default="./checkpoints/amb3r.pt",
         help="Path to AMB3R checkpoint.")
-    parser.add_argument("--ram_checkpoint", type=str, default="./checkpoints/ram_plus.pth",
-        help="Path to RAM++ checkpoint.")
-    parser.add_argument("--sam_checkpoint", type=str, default="./checkpoints/sam_vit_b.pth",
-        help="Path to SAM ViT-B checkpoint.")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
         help="Device to run inference on.")
     parser.add_argument("--no-semantic", action="store_true", default=False,
         help="Skip semantic labelling stage.")
-    parser.add_argument("--sam-only", action="store_true", default=False,
-        help="Debug: run SAM segmentation only (no labels). Useful for checking mask quality.")
     parser.add_argument("--no-viewer", action="store_true", default=False,
         help="Skip the interactive 3D viewer (headless/server use).")
     return parser.parse_args()
@@ -92,7 +87,7 @@ def main():
     frames_dir = output_dir / "frames"
     frames_dir.mkdir(exist_ok=True)
 
-    semantic_enabled = not args.no_semantic and not args.sam_only
+    semantic_enabled = not args.no_semantic
     total_stages = 5 if semantic_enabled else 4
 
     print(f"\n  video-to-3d pipeline")
@@ -104,7 +99,7 @@ def main():
     # ------------------------------------------------------------------ #
     # Stage 1: Frame Extraction
     # ------------------------------------------------------------------ #
-    banner(f"Stage 1 / {total_stages} — Frame Extraction")
+    banner(f"Stage 1 / {total_stages} - Frame Extraction")
     t0 = time.time()
 
     n_frames = extract_frames(
@@ -122,7 +117,7 @@ def main():
     # ------------------------------------------------------------------ #
     # Stage 2: AMB3R Reconstruction
     # ------------------------------------------------------------------ #
-    banner(f"Stage 2 / {total_stages} — AMB3R Reconstruction")
+    banner(f"Stage 2 / {total_stages} - AMB3R Reconstruction")
     t1 = time.time()
 
     reconstruction = run_amb3r(
@@ -144,7 +139,7 @@ def main():
     # ------------------------------------------------------------------ #
     # Stage 3: Export
     # ------------------------------------------------------------------ #
-    banner(f"Stage 3 / {total_stages} — Exporting Results")
+    banner(f"Stage 3 / {total_stages} - Exporting Results")
     t2 = time.time()
 
     exported = export_results(
@@ -156,61 +151,22 @@ def main():
     print(f"  Export complete  ({time.time() - t2:.1f}s)")
 
     # ------------------------------------------------------------------ #
-    # Stage 4 (optional): SAM debug — masks only, no labels
-    # ------------------------------------------------------------------ #
-    if args.sam_only:
-        banner("Stage 4 — SAM Debug (masks only)")
-        from pipeline.semantic import run_sam_debug
-        sam_ckpt = Path(args.sam_checkpoint)
-        if not sam_ckpt.exists():
-            print(f"  [WARNING] SAM checkpoint not found: {sam_ckpt}")
-        else:
-            t3 = time.time()
-            debug_ply = run_sam_debug(
-                reconstruction=reconstruction,
-                output_dir=output_dir,
-                conf_thresh=args.conf,
-                sam_checkpoint=sam_ckpt,
-                device=args.device,
-            )
-            free_gpu()
-            print(f"  SAM debug complete  ({time.time() - t3:.1f}s)")
-            if not args.no_viewer:
-                banner("Viewer — SAM Debug")
-                view_pointcloud(debug_ply)
-        return
-
-    # ------------------------------------------------------------------ #
     # Stage 4: Semantic Labelling
     # ------------------------------------------------------------------ #
     semantic_result = None
     if semantic_enabled:
-        banner(f"Stage 4 / {total_stages} — Semantic Labelling")
+        banner(f"Stage 4 / {total_stages} - Semantic Labelling")
         t3 = time.time()
 
-        ram_ckpt = Path(args.ram_checkpoint)
-        sam_ckpt = Path(args.sam_checkpoint)
-
-        if not ram_ckpt.exists():
-            print(f"  [WARNING] RAM checkpoint not found: {ram_ckpt}")
-            print("  Run: bash checkpoints/download_weights.sh")
-            print("  Skipping semantic stage.")
-        elif not sam_ckpt.exists():
-            print(f"  [WARNING] SAM checkpoint not found: {sam_ckpt}")
-            print("  Run: bash checkpoints/download_weights.sh")
-            print("  Skipping semantic stage.")
-        else:
-            from pipeline.semantic import run_semantic
-            semantic_result = run_semantic(
-                reconstruction=reconstruction,
-                output_dir=output_dir,
-                conf_thresh=args.conf,
-                ram_checkpoint=ram_ckpt,
-                sam_checkpoint=sam_ckpt,
-                device=args.device,
-            )
-            print(f"  Semantic labelling complete  ({time.time() - t3:.1f}s)")
-            free_gpu()
+        from pipeline.semantic import run_semantic
+        semantic_result = run_semantic(
+            reconstruction=reconstruction,
+            output_dir=output_dir,
+            conf_thresh=args.conf,
+            device=args.device,
+        )
+        print(f"  Semantic labelling complete  ({time.time() - t3:.1f}s)")
+        free_gpu()
 
     # ------------------------------------------------------------------ #
     # Summary
@@ -229,7 +185,7 @@ def main():
     # Stage 5: Viewer
     # ------------------------------------------------------------------ #
     if not args.no_viewer:
-        banner(f"Stage {total_stages} / {total_stages} — Launching Viewer")
+        banner(f"Stage {total_stages} / {total_stages} - Launching Viewer")
         if semantic_result:
             view_semantic_pointcloud(
                 ply_path=semantic_result['ply_path'],
