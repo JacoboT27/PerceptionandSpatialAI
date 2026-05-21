@@ -2,6 +2,8 @@ pipeline/__pycache__
 
 # amb3r model
 checkpoints/amb3r.pt
+checkpoints/ram_plus.pth
+checkpoints/sam_vit_b.pth
 
 # input videos
 inputs/
