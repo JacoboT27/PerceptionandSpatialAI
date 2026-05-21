@@ -99,6 +99,23 @@ RUN python -c "import torch; cu=torch.version.cuda; print('[verify] torch', torc
  && python -c "import xformers; print('[verify] xformers', xformers.__version__)" \
  && python -c "import torch_scatter, os; d=os.path.dirname(torch_scatter.__file__); cu=[f for f in os.listdir(d) if 'cuda' in f and f.endswith('.so')]; print('[verify] torch_scatter CUDA ext:', cu); assert cu, 'torch_scatter built WITHOUT CUDA (FORCE_CUDA not set?)'"
 
+# --- Semantic labelling dependencies (RAM++ + SAM + CLIP) ---
+# Added after the verify block so editing these never invalidates
+# the slow flash-attn / torch_scatter / xformers layers above.
+#
+# RAM++ : open-vocabulary automatic image tagger (no prompts needed)
+# SAM   : Segment Anything Model — automatic mask generation
+# CLIP  : assigns RAM tags to SAM masks by image-text similarity
+RUN pip install \
+    segment-anything \
+    ftfy \
+    regex \
+    "git+https://github.com/openai/CLIP.git" \
+    "git+https://github.com/xinyu1205/recognize-anything.git"
+
+# --- Guard: confirm semantic deps didn't move torch off 2.7.1 ---
+RUN python -c "import torch; v=torch.__version__; assert v.startswith('2.7.1'), f'SEMANTIC DEPS ABORTED: torch moved to {v}'; print(f'[guard] torch still OK after semantic deps: {v}')"
+
 # --- Clone AMB3R with all submodules ---
 WORKDIR /opt
 RUN git clone --recursive https://github.com/HengyiWang/amb3r.git
