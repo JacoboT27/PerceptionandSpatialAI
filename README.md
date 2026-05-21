@@ -1,4 +1,4 @@
-# From Video to 3D Reconstruction
+# From Video to 3D Reconstruction with Semantic Labelling
 
 **Reconstruct and semantically label a 3D scene from a phone video**
 
@@ -13,20 +13,21 @@ phone video  ->  frame extraction  ->  AMB3R reconstruction  ->  semantic labell
 
 | Input Video | Viewer |
 |---|---|
-| ![input](examples/basketball.png) | ![pointcloud](examples/basketball_reconstruction.png)|
-| ![segmentation](examples/segmentation.png) | ![labels] (examples/labels.png) |
+| ![input](examples/basketball.png) | ![pointcloud](examples/basketball_reconstruction.png) |
+| Segmentation | Labels |
+| ![segmentation](examples/segmentation.png) | ![labels](examples/labels.png) |
 
 ---
 
 ## Design Choices
 
-**Docker:** the entire environment (CUDA, PyTorch, all dependencies) is containerised. Users only need Docker and NVIDIA drivers. No conda, no pip conflicts, no manual CUDA setup.
+**Docker:** the entire environment (CUDA, PyTorch, all dependencies) is containerised. Useful for compatibility across users
 
-**AMB3R over COLMAP:** COLMAP was my first option, however it takes a lot of time doing the feature matching process and minimizing the reprojection error. On the other hand, AMB3R is feed-forward inference in a single pass. No iterative optimisation, no feature matching pipeline, no calibration required. My main limitation right now is the hardware. With only 8 GB of VRAM on my GPU I cannot process large videos.
+**AMB3R over COLMAP:** COLMAP was my first option, however it takes a lot of time doing the feature matching process and minimizing the reprojection error. On the other hand, AMB3R is feed-forward inference in a single pass. No iterative optimisation, no feature matching pipeline, no calibration required. My main limitation right now is the hardware. With only 8 GB of VRAM on my GPU I cannot process large videos. However, even with limited frames, the reconstruction is dense and of good quality.
 
-**Semantic labelling with a single segmentation model:** the labelling stage uses one pretrained semantic-segmentation model (Mask2Former, COCO-panoptic vocabulary). It runs once per frame and produces a per-pixel class. Because AMB3R's output is a dense per-pixel pointmap — every 3D point traces back to a known frame and pixel — the 2D labels transfer to 3D with a direct reshape, with no projection, masks, or extra models. One model in, labelled point cloud out.
+**Semantic labelling:** labelling stage uses one pretrained semantic-segmentation model (Mask2Former, COCO-panoptic vocabulary). It runs once per frame and produces a per-pixel class. Every 3D point traces back to a known frame and pixel. One model in, labelled point cloud out.
 
-**Two reconstruction outputs by default** — a filtered `.ply` for immediate inspection and an unfiltered `.ply` for re-thresholding without re-running the model. Camera poses are exported in Nerfstudio format so the pipeline can be extended to 3D Gaussian Splatting without changes.
+**Outputs** — a filtered `.ply` for immediate inspection and an unfiltered `.ply` for re-thresholding without re-running the model. Camera poses are exported in Nerfstudio format so the pipeline can be extended to 3D Gaussian Splatting without changes.
 
 All of the design choices were primarily focused on speed and ease of use. The user only has to run a command on the terminal with the path to the video, and receives a semantically labelled visualization of the 3D rendering.
 
@@ -93,7 +94,7 @@ Pull the pre-built image from GitHub Container Registry:
 docker compose pull
 ```
 
-> This downloads the pre-built image (~6–9 GB). Takes a few minutes depending on your connection — no compilation required.
+> This downloads the pre-built image. Takes a few minutes depending on your connection
 
 > **Alternatively**, build the image yourself from source:
 > ```bash
@@ -179,17 +180,17 @@ The `transforms.json` is in [Nerfstudio](https://docs.nerf.studio/) format. You 
 ```
 Video
   │
-  ▼
+  v
 extract_frames.py    — ffmpeg samples the video at --fps frames/sec
   │
-  ▼
+  v
 reconstruct.py       — AMB3R transformer predicts per-frame 3D pointmaps
   │                    and camera-to-world poses in a single forward pass.
   │                    No camera calibration or COLMAP needed.
-  ▼
+  v
 export.py            — Filters points by confidence, writes .ply + transforms.json
   │
-  ▼
+  v
 semantic.py          — A Mask2Former model segments each frame into classes;
                        because AMB3R's pointmap is dense and per-pixel, those
                        labels transfer to the point cloud with a direct reshape.
@@ -249,7 +250,7 @@ docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu22.04 nvidia-smi
 ### Out of memory (OOM) during reconstruction
 Reduce the number of frames fed to AMB3R:
 ```bash
-python run.py --video inputs/myvideo.mp4 --max_frames 12 --fps 1
+docker compose run --rm -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix app python run.py --video inputs/myvideo.mp4 --max_frames 18 --fps 1
 ```
 
 ---
@@ -266,7 +267,7 @@ If the Google Drive download fails, download `amb3r.pt` manually from the [AMB3R
 ### Point cloud looks sparse or noisy
 Try lowering the confidence threshold:
 ```bash
-python run.py --video inputs/myvideo.mp4 --conf 0.3
+docker compose run --rm -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix app python run.py --video inputs/myvideo.mp4 --conf 0.3
 ```
 The unfiltered point cloud (`scene_unfiltered.ply`) is always saved alongside — you can re-threshold it in MeshLab without re-running the pipeline.
 
