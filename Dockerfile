@@ -110,6 +110,8 @@ RUN pip install \
     segment-anything \
     ftfy \
     regex \
+    fairscale \
+    "transformers==4.35.2" \
     "git+https://github.com/openai/CLIP.git" \
     "git+https://github.com/xinyu1205/recognize-anything.git"
 
