@@ -3,6 +3,13 @@ pipeline/reconstruct.py
 -----------------------
 Wraps AMB3R inference.
 Takes a directory of images, returns pointmaps, colours, confidence, and camera poses.
+
+NOTE on dependency patching:
+  - torch_scatter is the REAL package, built from source in the Dockerfile
+    against torch 2.7.1 for sm_120. It is NOT patched. (The old pure-Python
+    patch was incomplete — it lacked segment_csr, which PTV3's backend needs.)
+  - pytorch3d genuinely cannot be compiled for this stack, so its two ops
+    used by AMB3R (knn_points, knn_gather) are still monkey-patched below.
 """
 
 from pathlib import Path
@@ -28,12 +35,60 @@ def _check_checkpoint(checkpoint_path: Path):
         )
 
 
+def _patch_pytorch3d():
+    """
+    pytorch3d fails to compile for this PyTorch + Blackwell stack.
+    AMB3R only uses knn_points and knn_gather from pytorch3d.ops —
+    both are straightforward to reimplement with native PyTorch.
+    """
+    import sys
+    import types
+    import torch
+
+    def knn_points(p1, p2, lengths1=None, lengths2=None, K=1,
+                   return_nn=False, return_sorted=True):
+        # p1: (N, P1, D), p2: (N, P2, D)
+        dists = torch.cdist(p1, p2)                          # (N, P1, P2)
+        knn_dists, knn_idx = dists.topk(K, dim=-1, largest=False, sorted=return_sorted)
+
+        class KNNOutput:
+            def __init__(self, dists, idx):
+                self.dists = dists   # (N, P1, K)
+                self.idx   = idx     # (N, P1, K)
+        return KNNOutput(knn_dists ** 2, knn_idx)  # cdist returns L2; pytorch3d returns squared
+
+    def knn_gather(p, idx, lengths=None):
+        # p:   (N, P2, D)
+        # idx: (N, P1, K)
+        # returns (N, P1, K, D)
+        N, P2, D   = p.shape
+        _, P1, K   = idx.shape
+        idx_flat   = idx.reshape(N, P1 * K)                  # (N, P1*K)
+        gathered   = torch.gather(
+            p, 1, idx_flat.unsqueeze(-1).expand(N, P1 * K, D)
+        )                                                      # (N, P1*K, D)
+        return gathered.reshape(N, P1, K, D)
+
+    # Build a minimal pytorch3d.ops sub-module
+    ops_mod = types.ModuleType('pytorch3d.ops')
+    ops_mod.knn_points = knn_points
+    ops_mod.knn_gather  = knn_gather
+
+    root_mod = types.ModuleType('pytorch3d')
+    root_mod.ops = ops_mod
+
+    sys.modules['pytorch3d']      = root_mod
+    sys.modules['pytorch3d.ops']  = ops_mod
+    print("  [patch] pytorch3d.ops replaced with native PyTorch implementation.")
+
+
 def run_amb3r(
     frames_dir: Path,
     checkpoint_path: Path,
     device: str = "cuda",
     conf_thresh: float = 0.5,
     max_images: int = 150,
+    iters: int = 0,
 ) -> Dict[str, np.ndarray]:
     """
     Run AMB3R feed-forward 3D reconstruction on a folder of images.
@@ -57,18 +112,25 @@ def run_amb3r(
     checkpoint_path = Path(checkpoint_path)
     _check_checkpoint(checkpoint_path)
 
+    # pytorch3d cannot be compiled for this stack, so patch it before any
+    # AMB3R imports. torch_scatter is the real, source-built package now —
+    # it must NOT be patched (the old patch lacked segment_csr).
+    _patch_pytorch3d()
+
     print(f"  Loading AMB3R weights from: {checkpoint_path}")
 
     # --- Import AMB3R (must be inside Docker / conda env with amb3r installed) ---
     try:
         from amb3r.model import AMB3R
         from amb3r.datasets import Demo
-    except ImportError:
-        raise ImportError(
-            "AMB3R package not found. Make sure you are running inside the "
-            "Docker container or the correct conda environment.\n"
-            "See README.md for setup instructions."
-        )
+    except ModuleNotFoundError as e:
+        if 'amb3r' in str(e):
+            raise ImportError(
+                "AMB3R package not found. Make sure you are running inside the "
+                "Docker container or the correct conda environment.\n"
+                "See README.md for setup instructions."
+            ) from e
+        raise  # re-raise any other ModuleNotFoundError with original traceback
 
     # --- Load model ---
     model = AMB3R()
@@ -99,13 +161,19 @@ def run_amb3r(
         if isinstance(views_all[key], torch.Tensor):
             views_all[key] = views_all[key].to(device)
 
-    print(f"  Running inference on {views_all['images'].shape[1]} frames...")
+    print(f"  Running inference on {views_all['images'].shape[1]} frames "
+          f"(iters={iters}: {'front-end only' if iters == 0 else 'with back-end'})...")
 
     # --- Forward pass ---
+    # AMB3R.forward(frames, iters) runs the VGGT front-end once, then `iters`
+    # sparse-voxel back-end refinement passes. iters=0 -> front-end only: it
+    # skips the entire memory-hungry back-end (the stage that OOMs on GPUs with
+    # limited VRAM) and still returns full pointmaps, confidence, and poses.
+    # This is exactly the demo's "0 / 1 : disable / enable backend" toggle.
     with torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu',
                         dtype=torch.bfloat16):
         with torch.no_grad():
-            res = model(views_all)
+            res = model(views_all, iters=iters)
 
     # --- Extract outputs ---
     # Debug: inspect model output structure
