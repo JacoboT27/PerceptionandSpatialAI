@@ -2,22 +2,27 @@
 # video-to-3d - Dockerfile  (Blackwell / RTX 50-series build)
 # ============================================================
 # Base: CUDA 12.8 + cuDNN on Ubuntu 22.04.
-# CUDA 12.8 is the FIRST toolkit with Blackwell (sm_120) support.
-# CUDA 12.4 does NOT support sm_120 - that is the root cause of the
-# "no kernel image is available for execution on the device" error.
+# CUDA 12.8 is the first toolkit with Blackwell (sm_120) support;
+# CUDA 12.4 does NOT support sm_120.
 #
-# Expect a LONG first build (flash-attn is compiled from source for
-# sm_120). Subsequent builds are cached.
+# Build-order note: flash-attn (the slowest layer) is compiled
+# right after PyTorch, so editing later dependencies does NOT
+# invalidate its cache. Expect a long FIRST build only.
 # ============================================================
 
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Limit parallel compile jobs so the flash-attn source build doesn't OOM.
+# Limit parallel compile jobs so source builds don't OOM the host.
 ENV MAX_JOBS=2
-# Tell every source build to emit Blackwell (sm_120) kernels + PTX.
+# Emit Blackwell (sm_120) kernels + PTX for every source build.
 ENV TORCH_CUDA_ARCH_LIST="12.0+PTX"
 ENV FLASH_ATTN_CUDA_ARCHS="120"
+# `docker build` has NO GPU, so torch.cuda.is_available() is False at build
+# time. Without FORCE_CUDA, torch_scatter (and similar PyG packages) detect
+# "no GPU" and silently build CPU-ONLY -> "Not compiled with CUDA support"
+# at run time. FORCE_CUDA=1 makes them compile CUDA kernels regardless.
+ENV FORCE_CUDA=1
 
 # --- System packages ---
 RUN apt-get update && apt-get install -y software-properties-common \
@@ -37,18 +42,31 @@ RUN pip install \
     torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
     --index-url https://download.pytorch.org/whl/cu128
 
-# --- torch-scatter / pytorch3d: deliberately NOT installed ---
-# pipeline/reconstruct.py monkey-patches sys.modules with pure-PyTorch
-# replacements for both BEFORE importing AMB3R, so the real packages are
-# never used. Installing them here would just add two more things to break.
+# --- flash-attn: built FROM SOURCE for sm_120, right after torch ---
+# Placed early (slowest + most stable layer) so editing later dependencies
+# does not invalidate its cache. ~20-40 min with MAX_JOBS=2. To skip the
+# wait, swap for a prebuilt wheel from
+#   https://github.com/mjun0812/flash-attention-prebuild-wheels
+# picking one tagged  cu128torch2.7-cp310 ... linux_x86_64
+RUN pip install flash-attn==2.7.4.post1 --no-build-isolation
 
-# --- Core numeric stack (pinned first so nothing else moves it) ---
+# --- Core numeric stack (pinned) ---
 RUN pip install numpy==1.26.4 scipy==1.13.1
 
+# --- torch-scatter: built FROM SOURCE against this torch, for sm_120 ---
+# AMB3R's PTV3 backend calls torch_scatter.segment_csr. FORCE_CUDA=1 (set
+# above) is ESSENTIAL here - without it this builds CPU-only and fails at
+# run time with "Not compiled with CUDA support".
+RUN pip install git+https://github.com/rusty1s/pytorch_scatter.git --no-build-isolation
+
+# --- pytorch3d: deliberately NOT installed ---
+# pytorch3d genuinely fails to compile for this stack. AMB3R uses only
+# knn_points / knn_gather from it, which reconstruct.py monkey-patches with
+# a complete pure-PyTorch implementation. That single patch stays.
+
 # --- AMB3R Python dependencies ---
-# !!! xformers MUST be pinned to the release built for this exact torch
-# version (0.0.31 -> torch 2.7.1). An unpinned `xformers` resolves to the
-# latest release and SILENTLY upgrades torch, breaking the whole stack.
+# !!! xformers MUST stay pinned (0.0.31 -> torch 2.7.1). An unpinned
+# xformers silently upgrades torch and breaks flash-attn / torch_scatter.
 RUN pip install \
     opencv-python==4.10.0.84 \
     xformers==0.0.31 \
@@ -70,26 +88,16 @@ RUN pip install \
     easydict==1.13 \
     "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@c5daf6f6c244d251f252102d09e9b7bcef791a38"
 
-# --- Guard: abort the build LOUDLY if a dependency moved torch off 2.7.1 ---
-RUN python -c "import torch; v=torch.__version__; assert v.startswith('2.7.1'), f'BUILD ABORTED: torch is {v}, a dependency upgraded it.'; print(f'[guard] torch OK: {v}')"
+# --- Guard: abort the build if a dependency moved torch off 2.7.1 ---
+RUN python -c "import torch; v=torch.__version__; assert v.startswith('2.7.1'), f'BUILD ABORTED: torch is {v}'; print(f'[guard] torch OK: {v}')"
 
-# --- flash-attn: built FROM SOURCE so the kernels include sm_120 ---
-# A prebuilt cu124/torch2.6 wheel physically cannot run on Blackwell.
-# Building against this CUDA 12.8 toolkit produces real sm_120 kernels.
-# SLOW: ~20-40 min with MAX_JOBS=2. To skip the wait, replace this line
-# with a prebuilt wheel from:
-#   https://github.com/mjun0812/flash-attention-prebuild-wheels
-# picking one tagged  cu128torch2.7-cp310 ... linux_x86_64
-RUN pip install flash-attn==2.7.4.post1 --no-build-isolation
-
-# --- Verify the critical stack imports cleanly ---
-# NOTE: torch.cuda.get_arch_list() CANNOT be used here. It returns [] unless a
-# GPU is visible, and `docker build` has no GPU. We verify the CUDA build tag
-# instead - cu128 wheels are the ones compiled with sm_120. The real sm_120
-# check happens at RUN time, when the container has the GPU (see instructions).
+# --- Verify the critical stack at build time (no GPU needed) ---
+# get_arch_list() can't be used here (returns [] without a GPU). Instead we
+# confirm the cu128 build tag and that torch_scatter compiled a CUDA ext.
 RUN python -c "import torch; cu=torch.version.cuda; print('[verify] torch', torch.__version__, 'cuda', cu); assert cu and cu.startswith('12.8'), f'torch is NOT a cu128 build (cuda={cu})'" \
  && python -c "import flash_attn; print('[verify] flash_attn', flash_attn.__version__)" \
- && python -c "import xformers; print('[verify] xformers', xformers.__version__)"
+ && python -c "import xformers; print('[verify] xformers', xformers.__version__)" \
+ && python -c "import torch_scatter, os; d=os.path.dirname(torch_scatter.__file__); cu=[f for f in os.listdir(d) if 'cuda' in f and f.endswith('.so')]; print('[verify] torch_scatter CUDA ext:', cu); assert cu, 'torch_scatter built WITHOUT CUDA (FORCE_CUDA not set?)'"
 
 # --- Clone AMB3R with all submodules ---
 WORKDIR /opt
@@ -100,5 +108,8 @@ WORKDIR /workspace
 COPY . /workspace/
 VOLUME ["/workspace/checkpoints", "/workspace/inputs", "/workspace/outputs"]
 ENV PYTHONPATH="/opt/amb3r:/opt/amb3r/thirdparty:${PYTHONPATH}"
+
+# --- Reduce VRAM fragmentation (helps on memory-constrained GPUs) ---
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 CMD ["bash"]
