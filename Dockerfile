@@ -7,12 +7,7 @@
 # Stage 2 (runtime): slim CUDA *runtime* base - only the built
 #   virtualenv, AMB3R, the model cache, and the few runtime
 #   system libs. No compiler toolchain ships in the final image.
-#
-# Net effect vs the single-stage build: ~2-3 GB smaller, and
-# (with .dockerignore + PIP_NO_CACHE_DIR) no baked-in data or
-# pip caches. First build still ~30-60 min (flash-attn compile).
 # ============================================================
-
 
 # ============================================================
 # Stage 1 - builder
