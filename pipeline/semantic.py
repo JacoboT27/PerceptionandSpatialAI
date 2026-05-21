@@ -92,14 +92,20 @@ def _run_ram(image_paths: List[Path], checkpoint: Path, device: str) -> List[Lis
 # Stage 2: SAM — automatic mask generation
 # --------------------------------------------------------------------------- #
 
-def _run_sam(image_paths: List[Path], checkpoint: Path, device: str):
+def _run_sam(image_paths: List[Path], checkpoint: Path, device: str,
+             target_size: Tuple = (518, 392)):
     """
     Run SAM automatic mask generation on each frame.
+    Images are resized to target_size (W, H) to match AMB3R's processing
+    resolution — this ensures pixel-perfect alignment during 3D projection.
+
     Returns a list of mask lists (one per frame).
-    Each mask is a dict with 'segmentation' (H, W bool array).
+    Each mask has 'segmentation' (H, W bool) at target_size resolution.
     """
     import torch
     from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+
+    target_w, target_h = target_size   # (518, 392)
 
     print(f"  Loading SAM from: {checkpoint}")
     sam = sam_model_registry["vit_b"](checkpoint=str(checkpoint))
@@ -107,19 +113,25 @@ def _run_sam(image_paths: List[Path], checkpoint: Path, device: str):
 
     generator = SamAutomaticMaskGenerator(
         sam,
-        points_per_side=16,        # lower = faster, fewer masks
+        points_per_side=16,
         pred_iou_thresh=0.88,
         stability_score_thresh=0.95,
-        min_mask_region_area=500,  # ignore tiny masks
+        min_mask_region_area=500,
     )
 
     all_masks = []
     for img_path in image_paths:
         img_bgr = cv2.imread(str(img_path))
+
+        # Resize to AMB3R's exact processing resolution so masks align with
+        # the world_points pixel grid — same crop/resize AMB3R applies
+        img_bgr = cv2.resize(img_bgr, (target_w, target_h),
+                             interpolation=cv2.INTER_LINEAR)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
         masks = generator.generate(img_rgb)
         all_masks.append(masks)
-        print(f"    {img_path.name}: {len(masks)} masks")
+        print(f"    {img_path.name}: {len(masks)} masks  (at {target_w}×{target_h})")
 
     return all_masks
 
@@ -181,9 +193,12 @@ def _assign_labels_clip(
                 best_idx = sims.argmax().item()
 
             label = tags[best_idx]
-            frame_labeled.append((seg, label))
+            area  = int(mask_info.get('area', seg.sum()))
+            frame_labeled.append((seg, label, area))
 
-        labeled_masks.append(frame_labeled)
+        # Sort largest → smallest so small objects are applied last and not overwritten
+        frame_labeled.sort(key=lambda x: x[2], reverse=True)
+        labeled_masks.append([(seg, label) for seg, label, _ in frame_labeled])
 
     return labeled_masks
 
@@ -198,55 +213,63 @@ def _project_labels(
     intrinsics: np.ndarray,
     pts_shape: Tuple,
     labeled_masks: List[List[Tuple]],
-    conf_mask: np.ndarray,
 ) -> np.ndarray:
     """
-    For each 3D point, project into each camera frame and assign the label
-    of the SAM mask that covers the projected pixel.
-
-    Args:
-        pts          : (N, 3) filtered world-space points
-        poses        : (T, 4, 4) camera-to-world transforms
-        intrinsics   : (T, 3, 3) camera intrinsic matrices
-        pts_shape    : (T, H, W) original point layout from AMB3R
-        labeled_masks: per-frame list of (mask, label) pairs
-        conf_mask    : boolean array of shape (T*H*W,) used for filtering
-
-    Returns:
-        labels : (N,) array of label strings, one per filtered point
+    Project each 3D point into all camera frames, look up the SAM/CLIP label
+    at each projected pixel, then assign the most common non-unknown label
+    (majority vote). Works for any scene — no hardcoded label names.
     """
     T, H, W = pts_shape
     N = pts.shape[0]
-    labels = np.full(N, "unknown", dtype=object)
 
-    # Build a label map per frame: (H, W) → label string
+    # Build label maps (H, W) per frame — already at AMB3R resolution
     label_maps = []
     for frame_labeled in labeled_masks:
         lmap = np.full((H, W), "unknown", dtype=object)
         for seg, label in frame_labeled:
-            # seg might be a different resolution — resize if needed
             if seg.shape != (H, W):
-                seg_resized = cv2.resize(
+                seg = cv2.resize(
                     seg.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST
                 ).astype(bool)
-            else:
-                seg_resized = seg
-            lmap[seg_resized] = label
+            lmap[seg] = label
         label_maps.append(lmap)
 
-    # For each point, find its source frame and pixel using the pts_shape layout
-    # Points are laid out as: point i → frame i//(H*W), row (i%(H*W))//W, col i%(H*W)%W
-    # We need to map filtered indices back to original indices
-    original_indices = np.where(conf_mask)[0]
+    pts_h  = np.concatenate([pts, np.ones((N, 1), dtype=np.float32)], axis=1)
+    votes  = [[] for _ in range(N)]
 
-    for out_idx, orig_idx in enumerate(original_indices):
-        frame_idx = orig_idx // (H * W)
-        remainder = orig_idx % (H * W)
-        row = remainder // W
-        col = remainder % W
+    for frame_idx in range(min(T, len(label_maps))):
+        lmap     = label_maps[frame_idx]
+        pose_c2w = poses[frame_idx]
+        K        = intrinsics[frame_idx].copy()
 
-        if frame_idx < len(label_maps):
-            labels[out_idx] = label_maps[frame_idx][row, col]
+        # AMB3R stores fx/fy normalised (<1.0); cx/cy are already in pixels
+        if K[0, 0] < 2.0:
+            K[0, 0] *= W
+            K[1, 1] *= H
+
+        pose_w2c = np.linalg.inv(pose_c2w)
+        pts_cam  = (pose_w2c @ pts_h.T).T[:, :3]
+
+        valid    = pts_cam[:, 2] > 0.01
+        if not valid.any():
+            continue
+
+        u = (K[0, 0] * pts_cam[:, 0] / pts_cam[:, 2] + K[0, 2]).astype(np.int32)
+        v = (K[1, 1] * pts_cam[:, 1] / pts_cam[:, 2] + K[1, 2]).astype(np.int32)
+
+        in_frame = valid & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+
+        for i in np.where(in_frame)[0]:
+            votes[i].append(lmap[v[i], u[i]])
+
+    # Majority vote: most common non-unknown label wins
+    labels = np.full(N, "unknown", dtype=object)
+    for i, vote_list in enumerate(votes):
+        if not vote_list:
+            continue
+        non_unknown = [l for l in vote_list if l != "unknown"]
+        if non_unknown:
+            labels[i] = max(set(non_unknown), key=non_unknown.count)
 
     return labels
 
@@ -282,6 +305,77 @@ def _write_semantic_ply(path: Path, points: np.ndarray, colors: np.ndarray):
 # Main entry point
 # --------------------------------------------------------------------------- #
 
+def run_sam_debug(
+    reconstruction: Dict,
+    output_dir: Path,
+    conf_thresh: float,
+    sam_checkpoint: Path,
+    device: str = "cuda",
+) -> Path:
+    """
+    Debug mode: run SAM only, assign a random colour per mask, project into 3D.
+    No RAM, no CLIP, no labels. Use this to verify SAM is segmenting correctly
+    before attempting label assignment.
+    """
+    import torch
+
+    pts         = reconstruction["pts"]
+    conf_sig    = reconstruction["conf_sig"]
+    poses       = reconstruction["poses"]
+    intrinsics  = reconstruction["intrinsics"]
+    pts_shape   = reconstruction["pts_shape"]
+    image_paths = reconstruction["image_paths"]
+
+    conf_mask    = conf_sig > conf_thresh
+    pts_filtered = pts[conf_mask]
+    T, H, W      = pts_shape
+
+    print(f"  [SAM debug] Running on {len(image_paths)} frames...")
+    all_masks = _run_sam(image_paths, sam_checkpoint, device, target_size=(W, H))
+
+    # Assign a random colour per unique mask index across all frames
+    rng = np.random.default_rng(42)
+    colors_out = reconstruction["colors"][conf_mask].copy()  # start from original RGB
+
+    original_indices = np.where(conf_mask)[0]
+
+    for frame_idx, masks in enumerate(all_masks):
+        # Sort largest first so small masks paint over large ones
+        masks_sorted = sorted(masks, key=lambda m: m.get('area', 0), reverse=True)
+
+        for mask_info in masks_sorted:
+            seg = mask_info['segmentation']
+            if seg.shape != (H, W):
+                seg = cv2.resize(
+                    seg.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST
+                ).astype(bool)
+
+            # Random colour for this mask
+            color = rng.random(3).astype(np.float32)
+
+            # Find all output points that belong to this frame + mask pixel
+            frame_start = frame_idx * H * W
+            frame_end   = frame_start + H * W
+            frame_orig  = np.arange(frame_start, frame_end)
+
+            # Which of those are in the filtered set?
+            # Map original indices back to output positions
+            for out_idx, orig_idx in enumerate(original_indices):
+                if frame_start <= orig_idx < frame_end:
+                    remainder = orig_idx - frame_start
+                    row = remainder // W
+                    col = remainder % W
+                    if seg[row, col]:
+                        # Blend 60% mask colour + 40% original
+                        colors_out[out_idx] = 0.6 * color + 0.4 * colors_out[out_idx]
+
+    output_dir = Path(output_dir)
+    ply_path = output_dir / "scene_sam_debug.ply"
+    print(f"  Writing SAM debug point cloud → {ply_path}")
+    _write_semantic_ply(ply_path, pts_filtered, np.clip(colors_out, 0, 1))
+    return ply_path
+
+
 def run_semantic(
     reconstruction: Dict,
     output_dir: Path,
@@ -313,10 +407,16 @@ def run_semantic(
     pts_shape   = reconstruction["pts_shape"]
     image_paths = reconstruction["image_paths"]
 
-    conf_mask = conf_sig > conf_thresh
+    conf_mask    = conf_sig > conf_thresh
     pts_filtered = pts[conf_mask]
 
+    # For semantic projection use ALL points (no confidence filter) so that
+    # low-confidence regions (shiny/reflective objects like basketballs) still
+    # get labeled. We apply conf_mask only when writing the final .ply.
+    pts_all = pts
+
     print(f"  Labelling {pts_filtered.shape[0]:,} points across {len(image_paths)} frames...")
+    print(f"  (Projection uses all {pts_all.shape[0]:,} points to capture low-confidence objects)")
 
     # --- Stage 1: RAM ---
     print("\n  [1/3] Running RAM++ (automatic image tagging)...")
@@ -334,11 +434,14 @@ def run_semantic(
     print("\n  [3/3] Assigning labels via CLIP...")
     labeled_masks = _assign_labels_clip(image_paths, all_masks, all_tags, device)
 
-    # --- Stage 4: Project into 3D ---
+    # --- Stage 4: Project into 3D (all points, no confidence filter) ---
     print("\n  Projecting labels into 3D...")
-    labels = _project_labels(
-        pts_filtered, poses, intrinsics, pts_shape, labeled_masks, conf_mask
+    labels_all = _project_labels(
+        pts_all, poses, intrinsics, pts_shape, labeled_masks
     )
+
+    # Apply confidence mask for final output
+    labels = labels_all[conf_mask]
 
     # --- Build colour array from labels ---
     unique_labels = sorted(set(labels.tolist()))
@@ -348,11 +451,17 @@ def run_semantic(
 
     colors_semantic = np.array([label_colors[lbl] for lbl in labels], dtype=np.float32)
 
+    # Blend semantic colours with original RGB — preserves texture while adding labels
+    alpha = 0.55   # semantic weight (0 = original only, 1 = semantic only)
+    original_colors = reconstruction["colors"][conf_mask]
+    colors_blended  = alpha * colors_semantic + (1.0 - alpha) * original_colors
+    colors_blended  = np.clip(colors_blended, 0.0, 1.0)
+
     # --- Write semantic .ply ---
     output_dir = Path(output_dir)
     ply_path = output_dir / "scene_semantic.ply"
     print(f"  Writing semantic point cloud → {ply_path}")
-    _write_semantic_ply(ply_path, pts_filtered, colors_semantic)
+    _write_semantic_ply(ply_path, pts_filtered, colors_blended)
 
     # --- Write labels.json summary ---
     label_info = {}
@@ -375,6 +484,6 @@ def run_semantic(
         "label_info":      label_info,
         "labels":          labels,
         "pts_filtered":    pts_filtered,
-        "colors_semantic": colors_semantic,
+        "colors_semantic": colors_blended,
         "label_colors":    label_colors,
     }

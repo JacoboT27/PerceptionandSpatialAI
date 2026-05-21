@@ -85,7 +85,18 @@ def _launch_viewer(pcd, title: str = "video-to-3d"):
     import open3d as o3d
 
     vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name=title, width=1280, height=720)
+    created = vis.create_window(window_name=title, width=1280, height=720)
+
+    if not created:
+        print()
+        print("  [viewer] Could not open display window. To fix this, run on your host:")
+        print("           xhost +local:docker")
+        print("  Then rerun with:")
+        print("           docker compose run --rm -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix app python run.py ...")
+        print()
+        print("  Your point cloud was saved and can be opened manually in MeshLab or CloudCompare.")
+        return
+
     vis.add_geometry(pcd)
 
     opt = vis.get_render_option()
@@ -108,17 +119,20 @@ def _launch_viewer(pcd, title: str = "video-to-3d"):
     vis.destroy_window()
 
 
-def _print_legend(label_info: Dict):
-    """Print a colour-coded legend to the terminal using ANSI escape codes."""
+def _print_legend(label_info: Dict, min_pct: float = 5.0):
+    """Print dominant labels only (above min_pct threshold)."""
+    dominant = {k: v for k, v in label_info.items() if v['percentage'] >= min_pct}
+    if not dominant:
+        dominant = label_info  # fallback: show all if none pass threshold
+
     print()
     print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  Semantic Legend                                 │")
+    print("  │  Semantic Legend  (labels ≥ 5% of points)       │")
     print("  ├─────────────────────────────────────────────────┤")
-    for label, info in sorted(label_info.items(), key=lambda x: -x[1]['point_count']):
+    for label, info in sorted(dominant.items(), key=lambda x: -x[1]['point_count']):
         r, g, b  = info['color_rgb']
         count    = info['point_count']
         pct      = info['percentage']
-        # ANSI 24-bit colour block
         color_block = f"\033[48;2;{r};{g};{b}m   \033[0m"
         print(f"  │  {color_block}  {label:<20} {count:>8,} pts  ({pct:>5.1f}%)  │")
     print("  └─────────────────────────────────────────────────┘")
