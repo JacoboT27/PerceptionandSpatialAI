@@ -52,6 +52,8 @@ def parse_args():
         help="Device to run inference on.")
     parser.add_argument("--no-semantic", action="store_true", default=False,
         help="Skip semantic labelling stage.")
+    parser.add_argument("--sam-only", action="store_true", default=False,
+        help="Debug: run SAM segmentation only (no labels). Useful for checking mask quality.")
     parser.add_argument("--no-viewer", action="store_true", default=False,
         help="Skip the interactive 3D viewer (headless/server use).")
     return parser.parse_args()
@@ -90,7 +92,7 @@ def main():
     frames_dir = output_dir / "frames"
     frames_dir.mkdir(exist_ok=True)
 
-    semantic_enabled = not args.no_semantic
+    semantic_enabled = not args.no_semantic and not args.sam_only
     total_stages = 5 if semantic_enabled else 4
 
     print(f"\n  video-to-3d pipeline")
@@ -152,6 +154,31 @@ def main():
         frames_dir=frames_dir,
     )
     print(f"  Export complete  ({time.time() - t2:.1f}s)")
+
+    # ------------------------------------------------------------------ #
+    # Stage 4 (optional): SAM debug — masks only, no labels
+    # ------------------------------------------------------------------ #
+    if args.sam_only:
+        banner("Stage 4 — SAM Debug (masks only)")
+        from pipeline.semantic import run_sam_debug
+        sam_ckpt = Path(args.sam_checkpoint)
+        if not sam_ckpt.exists():
+            print(f"  [WARNING] SAM checkpoint not found: {sam_ckpt}")
+        else:
+            t3 = time.time()
+            debug_ply = run_sam_debug(
+                reconstruction=reconstruction,
+                output_dir=output_dir,
+                conf_thresh=args.conf,
+                sam_checkpoint=sam_ckpt,
+                device=args.device,
+            )
+            free_gpu()
+            print(f"  SAM debug complete  ({time.time() - t3:.1f}s)")
+            if not args.no_viewer:
+                banner("Viewer — SAM Debug")
+                view_pointcloud(debug_ply)
+        return
 
     # ------------------------------------------------------------------ #
     # Stage 4: Semantic Labelling
