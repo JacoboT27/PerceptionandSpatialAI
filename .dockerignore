@@ -1,0 +1,25 @@
+# Data directories — mounted as volumes at runtime, must NOT be baked
+# into the image (this is what bloats it the most).
+inputs/
+outputs/
+checkpoints/
+
+# Repo assets not needed inside the container
+examples/
+.git/
+.gitignore
+README.md
+HANDOFF.md
+
+# Python / OS cruft
+**/__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Stray large files
+*.ply
+*.mp4
+*.mov
+*.pt
+*.pth
